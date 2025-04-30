@@ -1,69 +1,97 @@
 # lambda/index.py
 import json
 import os
-import boto3
 import re  # 正規表現モジュールをインポート
-from botocore.exceptions import ClientError
-import urllib.request
-import urllib.error
+from urllib import request , error
 
-#FAstAPIのURLを環境変数から取得
-FASTAPI_URL      = os.environ.get("https://478e-35-198-202-33.ngrok-free.app")   
-FASTAPI_ENDPOINT = f"{FASTAPI_URL.rstrip('/')}/generate" if FASTAPI_URL else None
+#Fast API：endpoint
+API_URL = "https://abcdefgh.ngrok.io/generate"
 
-#lamda endpoint作成
+# Lambda ハンドラー関数
 def lambda_handler(event, context):
     try:
-        if FASTAPI_ENDPOINT is None:
-            raise RuntimeError("環境変数 FASTAPI_URL が設定されていません")
+        body = json.loads(event['body'])
+        message = body['message']
+        conversation_history = body.get('conversationHistory', [])
 
-        # リクエストボディの解析
-        body = json.loads(event.get("body", "{}"))
-        message = body["message"]
-        conversation_history = body.get("conversationHistory", [])
+        # 会話履歴にユーザーメッセージを追加
+        messages = conversation_history.copy()
+        messages.append({
+            "role": "user",
+            "content": message
+        })
 
-        # FastAPI へ転送
-        payload = json.dumps({
-            "message": message,
-            "conversationHistory": conversation_history
-        }).encode("utf-8")
+        request_payload = {
+            "prompt": message,
+            "max_new_tokens": 512,
+            "do_sample": True,
+            "temperature": 0.7,
+            "top_p": 0.9
+        }
 
-        req = urllib.request.Request(
-            FASTAPI_ENDPOINT,
-            data=payload,
+        # JSON → バイト列に変換
+        data = json.dumps(request_payload).encode("utf-8")
+
+        # 3. FastAPI サーバーへ POST リクエスト
+        req = request.Request(
+            API_URL,
+            data=data,
             headers={"Content-Type": "application/json"},
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            fastapi_resp = json.loads(resp.read().decode("utf-8"))
 
-        if not fastapi_resp.get("success"):
-            raise RuntimeError(fastapi_resp.get("error", "Unknown FastAPI error"))
+        with request.urlopen(req) as resp:
+            resp_text = resp.read().decode("utf-8")
+            status_code = resp.getcode()
 
-        assistant_response  = fastapi_resp["response"]
-        conversation_history = fastapi_resp.get("conversationHistory", conversation_history)
+        if status_code != 200:
+            raise Exception(f"FastAPI サーバーからエラー: {status_code}")
 
-        # 成功レスポンス
+        resp_json = json.loads(resp_text)
+        assistant_response = resp_json.get("generated_text")
+        if not assistant_response:
+            raise Exception("FastAPI の応答に generated_text がありません")
+
+        # 会話履歴にアシスタントの応答を追加
+        messages.append({
+            "role": "assistant",
+            "content": assistant_response
+        })
+
         return {
             "statusCode": 200,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+                "Access-Control-Allow-Methods": "OPTIONS,POST"
+            },
             "body": json.dumps({
                 "success": True,
                 "response": assistant_response,
-                "conversationHistory": conversation_history
+                "conversationHistory": messages
             })
         }
 
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode()
-        error_msg = f"FastAPI HTTPError {e.code}: {detail}"
-    except Exception as e:
-        error_msg = str(e)
-
-    # エラー時レスポンス
-    return {
-        "statusCode": 500,
-        "body": json.dumps({
-            "success": False,
-            "error": error_msg
-        })
-    }
+    except error.HTTPError as e:
+        # FastAPI 側の エラー
+        err_body = e.read().decode("utf-8")
+        print(f"HTTPError: {e.code} {e.reason} {err_body}")
+        return {
+            "statusCode": 502,
+            "body": json.dumps({"success": False, "error": f"FastAPI エラー {e.code}: {err_body}"})
+        }
+    except error.URLError as e:
+        # ネットワークエラー
+        print(f"URLError: {e.reason}")
+        return {
+            "statusCode": 502,
+            "body": json.dumps({"success": False, "error": f"接続エラー: {e.reason}"})
+        }
+    except Exception as error:
+        # その他
+        print("Error:", str(error))
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"success": False, "error": str(error)})
+        }
